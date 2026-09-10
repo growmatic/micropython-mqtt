@@ -1,6 +1,19 @@
 # mqtt_as.py Asynchronous version of umqtt.robust
 # (C) Copyright Peter Hinch 2017-2025.
 # Released under the MIT licence.
+#
+# PATCH local (device light, 2026-08-25): este device usa network.ESP_HOSTED()
+# (WiFi via co-processador C3/SPI-FD), NAO network.WLAN(STA_IF) nativo -- e a
+# conexao/reconexao ja e gerenciada por light_mesh.py, assincrona, com sua
+# propria logica de retry. Empiricamente confirmado que WLAN(STA_IF) neste
+# firmware e uma interface totalmente separada e inativa, sem relacao com o
+# ESP_HOSTED() conectado -- entao o gerenciamento de WiFi nativo desta lib
+# (hardcoded em network.WLAN(STA_IF)) nao serve aqui.
+# Mudancas: (1) config["wifi_if"] permite injetar uma interface ja conectada
+# (nosso ESP_HOSTED()) no lugar do WLAN nativo; (2) quando injetada, esta lib
+# PARA de tentar conectar/desconectar WiFi por conta propria (isso e trabalho
+# do light_mesh.py) -- so espera/observa o estado, e cuida apenas da
+# reconexao em nivel de MQTT (que e o que realmente queremos dela).
 
 # Pyboard D support added also RP2/default
 # Various improvements contributed by Kevin Köck
@@ -18,7 +31,7 @@ import asyncio
 
 gc.collect()
 from time import ticks_ms, ticks_diff
-from errno import EINPROGRESS, ETIMEDOUT
+from errno import EINPROGRESS, ETIMEDOUT, EAGAIN
 
 gc.collect()
 from micropython import const
@@ -42,7 +55,14 @@ RP2 = platform == "rp2"
 NINA = RP2 and implementation._machine.startswith("Arduino")  # ublox Nina radio
 if ESP32:
     # https://forum.micropython.org/viewtopic.php?f=16&t=3608&p=20942#p20942
-    BUSY_ERRORS = [EINPROGRESS, ETIMEDOUT, 118, 119]  # Add in weird ESP32 errors
+    # PATCH local (2026-08-26): EAGAIN(11) adicionado -- e o que o socket TLS
+    # (extmod/modtls_mbedtls.c, socket_read/socket_write) levanta quando o
+    # handshake ainda nao terminou (MBEDTLS_ERR_SSL_WANT_READ/WRITE vira
+    # MP_EWOULDBLOCK == MP_EAGAIN == 11 nesse build). Sem isso aqui, _as_write/
+    # _as_read tratam esse retorno como erro fatal em vez de tentar de novo --
+    # ver do_handshake_on_connect=False mais abaixo e memoria
+    # light_mqtt_freeze_unreachable_host.md.
+    BUSY_ERRORS = [EINPROGRESS, ETIMEDOUT, EAGAIN, 118, 119]  # Add in weird ESP32 errors
 elif RP2 and not NINA:
     BUSY_ERRORS = [EINPROGRESS, ETIMEDOUT, -110]
 else:
@@ -110,6 +130,8 @@ config = {
     "gateway": False,
     "mqttv5": False,
     "mqttv5_con_props": None,
+    "wifi_if": None,  # PATCH local: interface ja conectada (ex. ESP_HOSTED()),
+                       # no lugar do WLAN(STA_IF) nativo. Ver nota no topo do arquivo.
 }
 
 
@@ -188,8 +210,14 @@ class MQTT_base:
         if self.server is None:
             raise ValueError("no server specified.")
         self._sock = None
-        self._sta_if = network.WLAN(network.STA_IF)
-        self._sta_if.active(True)
+        # PATCH local: WiFi externo (ESP_HOSTED) ja ativo/gerenciado pelo
+        # light_mesh.py -- nao mexe em .active()/.connect()/.disconnect() dele.
+        self._external_wifi = config["wifi_if"] is not None
+        if self._external_wifi:
+            self._sta_if = config["wifi_if"]
+        else:
+            self._sta_if = network.WLAN(network.STA_IF)
+            self._sta_if.active(True)
         if config["gateway"]:  # Called from gateway (hence ESP32).
             import aioespnow  # Set up ESPNOW
 
@@ -306,12 +334,71 @@ class MQTT_base:
         await asyncio.sleep_ms(0)
         self.dprint("Connecting to broker.")
         if self._ssl:
-            try:
-                import ssl
-            except ImportError:
-                import ussl as ssl
+            # PATCH local: usa SSLContext + load_cert_chain/load_verify_locations
+            # (padrao ja validado neste firmware para mTLS real, ver
+            # socket_tests/util.py) em vez do ssl.wrap_socket(**kwargs) original
+            # -- os nomes de kwargs aceitos por wrap_socket() variam entre
+            # builds de MicroPython e nao foram validados aqui.
+            # ssl_params esperado: {"cadata":..., "client_cert":path,
+            # "client_key":path, "server_hostname":...}
+            #
+            # PATCH local (2026-08-26): wrap_socket() com handshake completo
+            # (do_handshake_on_connect=True, o default) roda numa THREAD
+            # separada (_thread, outro nucleo do ESP32) em vez de direto aqui.
+            # Motivo: mesmo tratando WANT_READ/WANT_WRITE como "tenta de novo"
+            # (do_handshake_on_connect=False + EAGAIN em BUSY_ERRORS, ver
+            # BUSY_ERRORS acima), a ETAPA FINAL do handshake -- verificacao de
+            # certificado + troca de chave, crypto de verdade -- roda inteira
+            # numa unica chamada sincrona do mbedTLS (~3s medido neste
+            # hardware) que nao tem como ser interrompida/fatiada em Python.
+            # Isso travava o loop de asyncio (LVGL, encoder, clock_task) por
+            # esse tanto TODA VEZ que uma conexao/reconexao tinha sucesso --
+            # pouca coisa numa conexao isolada, mas se cair em retry
+            # frequente (rede instavel, broker caindo e voltando) o
+            # travamento de ~3s se repetiria a cada tentativa bem-sucedida.
+            # Rodar numa thread separada resolve de vez, sem depender de
+            # nenhum comportamento fino do mbedTLS: o handshake pode demorar
+            # o quanto precisar (rede lenta, host inalcancavel, crypto lenta)
+            # que o loop principal nunca sente. Ver memoria
+            # light_mqtt_freeze_unreachable_host.md.
+            import ssl
+            import _thread
 
-            self._sock = ssl.wrap_socket(self._sock, **self._ssl_params)
+            p = self._ssl_params
+            raw_sock = self._sock
+            handshake = {}
+            flag = asyncio.ThreadSafeFlag()
+
+            def _handshake_worker():
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.verify_mode = ssl.CERT_REQUIRED
+                    if p.get("cadata") is not None:
+                        ctx.load_verify_locations(cadata=p["cadata"])
+                    if p.get("client_cert") and p.get("client_key"):
+                        ctx.load_cert_chain(p["client_cert"], p["client_key"])
+                    # do_handshake_on_connect=True (default) -- bloqueante,
+                    # mas isso e o esperado/ok aqui: estamos numa thread so
+                    # pra isso, o loop principal continua livre.
+                    handshake["sock"] = ctx.wrap_socket(
+                        raw_sock, server_hostname=p.get("server_hostname"))
+                except Exception as e:
+                    handshake["error"] = e
+                flag.set()
+
+            # PATCH local (2026-08-26): stack maior pra thread do handshake.
+            # Crash reproduzido (Guru Meditation StoreProhibited) rodando a
+            # stack completa com o stack DEFAULT do _thread -- RSA-4096
+            # (usado pelos certs deste projeto) usa bastante stack dentro do
+            # mbedTLS, e o default do MicroPython/ESP32 e pequeno demais.
+            # 32KB e generoso (sobra PSRAM/heap nesta placa) e a thread
+            # termina logo depois do handshake, nao fica ocupando memoria.
+            _thread.stack_size(16 * 1024)
+            _thread.start_new_thread(_handshake_worker, ())
+            await flag.wait()
+            if "error" in handshake:
+                raise handshake["error"]
+            self._sock = handshake["sock"]
         premsg = bytearray(b"\x10\0\0\0\0\0")
         msg = bytearray(b"\x04MQTT\x00\0\0\0")
         msg[5] = 0x05 if mqttv5 else 0x04
@@ -453,6 +540,10 @@ class MQTT_base:
 
     def close(self):  # API. See https://github.com/peterhinch/micropython-mqtt/issues/60
         self._close()
+        if self._external_wifi:
+            # PATCH local: WiFi externo e do light_mesh.py -- fechar o MQTT
+            # nao deve derrubar a conexao usada por mesh/UI/RTC.
+            return
         try:
             self._sta_if.disconnect()  # Disconnect Wi-Fi to avoid errors
         except OSError:
@@ -713,6 +804,29 @@ class MQTTClient(MQTT_base):
 
     async def wifi_connect(self, quick=False):
         s = self._sta_if
+        if self._external_wifi:
+            # PATCH local (2026-08-26): mqtt_as e quem cuida de conectar/
+            # reconectar tambem na interface externa (network.ESP_HOSTED()
+            # deste projeto) -- igual faria com WLAN nativo, via
+            # self._ssid/self._wifi_pw (config["ssid"]/["wifi_pw"]). Versao
+            # anterior so ESPERAVA (s.isconnected()) sem nunca chamar
+            # .connect() sozinho, dependendo de outro modulo (light_mesh.py)
+            # pra trazer a interface de volta -- bug real achado por Rafael
+            # derrubando o roteador de proposito: a interface nunca
+            # reconectava sozinha. Nao chamamos .active()/.disconnect() aqui
+            # (quem cria/liga a interface e o dono dela fora deste modulo).
+            if not s.isconnected():
+                if self._ssid is None or self._wifi_pw is None:
+                    raise OSError("Wi-Fi externo sem ssid/wifi_pw configurados (config)")
+                try:
+                    s.connect(self._ssid, self._wifi_pw)
+                except OSError:
+                    pass  # ja pode estar tentando conectar -- segue pro poll abaixo
+            for _ in range(60):
+                if s.isconnected():
+                    return
+                await asyncio.sleep(1)
+            raise OSError("Wi-Fi externo nao conectou a tempo")
         if ESP8266:
             if s.isconnected():  # 1st attempt, already connected.
                 return
@@ -906,10 +1020,13 @@ class MQTTClient(MQTT_base):
                 await asyncio.sleep(1)
                 gc.collect()
             else:  # Link is down, socket is closed, tasks are killed
-                try:
-                    self._sta_if.disconnect()
-                except OSError:
-                    self.dprint("Wi-Fi not started, unable to disconnect interface")
+                if not self._external_wifi:
+                    try:
+                        self._sta_if.disconnect()
+                    except OSError:
+                        self.dprint("Wi-Fi not started, unable to disconnect interface")
+                # PATCH local: com WiFi externo, nao desconecta -- so espera
+                # o light_mesh.py trazer a interface de volta sozinho.
                 await asyncio.sleep(1)
                 try:
                     await self.wifi_connect()
