@@ -1,5 +1,17 @@
 # MicroPython Asynchronous MQTT
 
+> **Fork Growmatic** (`growmatic/micropython-mqtt`, de `peterhinch/micropython-mqtt`).
+> Patches locais em `mqtt_as/__init__.py`, todos marcados com `PATCH local` no código:
+> - `config["wifi_if"]`: usa uma interface WiFi já ativa (ex. `network.ESP_HOSTED()`) no
+>   lugar do `WLAN(STA_IF)` nativo, sem mexer em `.active()`/`.connect()` dela.
+> - Handshake TLS numa `_thread` com stack de 16K (o firmware libera o GIL no handshake
+>   mbedTLS), pra não travar o loop `asyncio`.
+> - **Negação do broker (SUBACK/PUBACK ≥ 0x80) não derruba mais a conexão** (2026-09-24):
+>   loga, chama `config["nak_cb"](kind, topic, reason_code)` se configurado, e
+>   `subscribe()`/`publish()` devolvem `False`. Upstream levantava `OSError` → reconexão →
+>   retry infinito. `_await_pid()` devolve o reason code num NAK (`False` continua sendo
+>   só "sem resposta/desconectou").
+
 MQTT is an easily used networking protocol designed for IOT (internet of
 things) applications. It is well suited for controlling hardware devices and
 for reading sensors across a local network or the internet.

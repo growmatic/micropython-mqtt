@@ -132,6 +132,8 @@ config = {
     "mqttv5_con_props": None,
     "wifi_if": None,  # PATCH local: interface ja conectada (ex. ESP_HOSTED()),
                        # no lugar do WLAN(STA_IF) nativo. Ver nota no topo do arquivo.
+    "nak_cb": None,  # PATCH local: nak_cb(kind, topic, reason_code) quando o
+                     # broker NEGA um SUBSCRIBE/UNSUBSCRIBE/PUBLISH (>=0x80).
 }
 
 
@@ -230,6 +232,14 @@ class MQTT_base:
 
         self.newpid = pid_gen()
         self.rcv_pids = set()  # PUBACK and SUBACK pids awaiting ACK response
+        # PATCH local (2026-09-24): pids que vieram NEGADOS (reason code
+        # >=0x80), nao so "sem resposta ainda" -- rcv_pids sozinho nao
+        # diferencia "ack de sucesso" de "nak", entao _await_pid() precisa
+        # consultar isto pra nao devolver True (sucesso) pra um pid que na
+        # verdade foi rejeitado. Ver _await_pid() e o handling de PUBACK/
+        # [UN]SUBACK em wait_msg() mais abaixo.
+        self._nak_pids = {}
+        self._nak_cb = config.get("nak_cb")
         self.last_rx = ticks_ms()  # Time of last communication from broker
         self.lock = asyncio.Lock()
         self._ibuf = bytearray(IBUFSIZE)
@@ -557,8 +567,38 @@ class MQTT_base:
                 break  # Must repub or bail out
             await asyncio.sleep_ms(100)
         else:
-            return True  # PID received. All done.
+            # PATCH local (2026-09-24): o pid saiu de rcv_pids tanto num
+            # ack de sucesso quanto num NAK (ver kill_pid() chamado nos 2
+            # casos, PUBACK/[UN]SUBACK em wait_msg()) -- sem este check,
+            # um NAK (ex: ACL negada) virava falso-positivo aqui (achado
+            # ao vivo testando um device sem autorizacao nenhuma no
+            # broker: subscribe()/publish() reportavam sucesso pra uma
+            # rejeicao de verdade). So devolve True se NAO foi NAK.
+            #
+            # PATCH local (2026-09-24, 2a rodada): num NAK devolve o proprio
+            # reason code (int >= 0x80) em vez de False -- False continua
+            # significando SO "sem resposta/desconectou" (quem chama faz
+            # republish/reconnect). Um NAK e resposta definitiva do broker:
+            # quem chama loga e avisa via _report_nak(), sem reconectar.
+            if pid in self._nak_pids:
+                return self._nak_pids.pop(pid)
+            return True  # PID recebido e aceito. Tudo certo.
         return False
+
+    # PATCH local (2026-09-24): negacao do broker (ACL, topico invalido...)
+    # NAO e falha de conexao -- antes virava OSError, _handle_msg reconectava
+    # e subscribe()/publish() retentavam pra sempre (cada tentativa = uma
+    # reconexao completa; achado no teste P+N real com um topico sem ACL).
+    # Decisao do Rafael: so loga e avisa (nak_cb publica no topico `error`).
+    def _report_nak(self, kind, topic, reason_code):
+        if isinstance(topic, (bytes, bytearray)):
+            topic = bytes(topic).decode()
+        print("mqtt_as: broker NEGOU %s em %s (reason code 0x%x)" % (kind, topic, reason_code))
+        if self._nak_cb is not None:
+            try:
+                self._nak_cb(kind, topic, reason_code)
+            except Exception as e:
+                print("mqtt_as: nak_cb falhou:", repr(e))
 
     # qos == 1: coro blocks until wait_msg gets correct PID.
     # If WiFi fails completely subclass re-publishes with new PID.
@@ -573,8 +613,12 @@ class MQTT_base:
 
         count = 0
         while 1:  # Await PUBACK, republish on timeout
-            if await self._await_pid(pid):
+            res = await self._await_pid(pid)
+            if res is True:
                 return
+            if res is not False:  # NAK: resposta definitiva, nao republica
+                self._report_nak("PUBLISH", topic, res)
+                return False
             # No match
             if count >= self._max_repubs or not self.isconnected():
                 raise OSError(-1)  # Subclass to re-publish with new PID
@@ -638,8 +682,12 @@ class MQTT_base:
                 # Are not supported.
                 await self._as_write(qos.to_bytes(1, "little"))
 
-        if not await self._await_pid(pid):
+        res = await self._await_pid(pid)
+        if res is False:
             raise OSError(-1)
+        if res is not True:  # NAK: resposta definitiva, nao reconecta
+            self._report_nak("SUBSCRIBE" if sub else "UNSUBSCRIBE", topic, res)
+            return False
 
     # Remove a pending pid after a successful receive.
     def kill_pid(self, pid, msg):
@@ -684,7 +732,25 @@ class MQTT_base:
                 reason_code = await self._as_read(1)
                 reason_code = reason_code[0]
                 if reason_code >= 0x80:
-                    raise OSError(-1, "PUBACK reason code 0x%x" % reason_code)
+                    # PATCH local (2026-09-24): libera o pid pendente ANTES
+                    # de levantar o erro -- sem isso, quem chamou publish()
+                    # (_await_pid) fica esperando pra sempre um ack que
+                    # nunca mais sera processado (esta task morre logo em
+                    # seguida, capturada por _handle_msg's `except OSError`,
+                    # que so faz `_reconnect()` sem limpar rcv_pids). Achado
+                    # ao vivo testando um device SEM autorizacao nenhuma no
+                    # broker (PUBACK/SUBACK negados travando o client pra
+                    # sempre em vez de erro limpo), 2026-09-24. Registra em
+                    # _nak_pids ANTES de kill_pid() -- sem isso, _await_pid()
+                    # nao consegue diferenciar "ack de sucesso" de "nak" so
+                    # olhando rcv_pids, e falso-positiva um NAK como sucesso
+                    # (2o bug achado no mesmo dia, revisao do agente do
+                    # servidor).
+                    #
+                    # 2a rodada (2026-09-24): NAO levanta mais -- o NAK
+                    # chega em publish() via _await_pid() (reason code) e
+                    # vira log + nak_cb, sem derrubar a conexao.
+                    self._nak_pids[pid] = reason_code
             if sz > 3:
                 puback_props_sz, _ = await self._recv_len()
                 if puback_props_sz > 0:
@@ -717,7 +783,15 @@ class MQTT_base:
                 reason_code = await self._as_read(sz)
                 reason_code = reason_code[0]
                 if reason_code >= 0x80:
-                    raise OSError(-1, f"{un}SUBACK reason code 0x{reason_code:x}")
+                    # PATCH local (2026-09-24): mesmo racional do PUBACK
+                    # acima -- libera o pid ANTES de levantar o erro, senao
+                    # subscribe()/unsubscribe() ficam travados pra sempre.
+                    # _nak_pids ANTES de kill_pid() -- mesmo motivo do PUBACK
+                    # (ver comentario la em cima): sem isso, _await_pid()
+                    # falso-positiva o NAK como sucesso.
+                    # 2a rodada (2026-09-24): NAO levanta mais -- mesmo
+                    # racional do PUBACK acima (vira log + nak_cb em _usub()).
+                    self._nak_pids[pid] = reason_code
             self.kill_pid(pid, f"{un}SUBACK")
 
         if op == 0xE0:  # DISCONNECT
@@ -926,6 +1000,7 @@ class MQTTClient(MQTT_base):
             self._in_connect = False  # Caller may run .isconnected()
             raise
         self.rcv_pids.clear()
+        self._nak_pids.clear()  # PATCH local (2026-09-24): sessao nova, sem NAK obsoleto
         # If we get here without error broker/LAN must be up.
         self._isconnected = True
         self._in_connect = False  # Low level code can now check connectivity.
