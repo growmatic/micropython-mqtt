@@ -648,11 +648,15 @@ class MQTT_base:
             await self._as_write(properties)
         await self._as_write(msg)
 
+    # PATCH local (2026-09-24): devolve o resultado do _usub() -- False quando
+    # o broker NEGA (SUBACK >= 0x80). Sem o `return`, o False se perdia aqui e
+    # quem chamava nunca via a negacao (achado em HW: "inscrito" logado logo
+    # depois de "broker NEGOU SUBSCRIBE").
     async def subscribe(self, topic, qos, properties=None):
-        await self._usub(topic, qos, properties)
+        return await self._usub(topic, qos, properties)
 
     async def unsubscribe(self, topic, properties=None):
-        await self._usub(topic, None, properties)
+        return await self._usub(topic, None, properties)
 
     # Subscribe/unsubscribe
     # Can raise OSError if WiFi fails. Subclass traps.
