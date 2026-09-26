@@ -130,6 +130,10 @@ config = {
     "gateway": False,
     "mqttv5": False,
     "mqttv5_con_props": None,
+    # PATCH growmatic: properties MQTTv5 mescladas em TODO PUBLISH (ex.: user
+    # properties de identidade do device, auditadas pelo servidor em cada
+    # mensagem). User properties (0x26) do publish() somam com estas.
+    "pub_props": None,
     "wifi_if": None,  # PATCH local: interface ja conectada (ex. ESP_HOSTED()),
                        # no lugar do WLAN(STA_IF) nativo. Ver nota no topo do arquivo.
     "nak_cb": None,  # PATCH local: nak_cb(kind, topic, reason_code) quando o
@@ -247,6 +251,7 @@ class MQTT_base:
 
         self.mqttv5 = config.get("mqttv5")
         self.mqttv5_con_props = config.get("mqttv5_con_props")
+        self._pub_props = config.get("pub_props")
         self.topic_alias_maximum = 0
 
         if self.mqttv5:
@@ -602,7 +607,24 @@ class MQTT_base:
 
     # qos == 1: coro blocks until wait_msg gets correct PID.
     # If WiFi fails completely subclass re-publishes with new PID.
+    def _merge_pub_props(self, properties):
+        base = self._pub_props
+        if not base:
+            return properties
+        if not properties:
+            return base
+        out = dict(base)
+        for key, val in properties.items():
+            if key == 0x26 and 0x26 in base:
+                user = dict(base[0x26])
+                user.update(val)
+                out[key] = user
+            else:
+                out[key] = val
+        return out
+
     async def publish(self, topic, msg, retain, qos, properties=None):
+        properties = self._merge_pub_props(properties)
         pid = next(self.newpid)
         if qos:
             self.rcv_pids.add(pid)
