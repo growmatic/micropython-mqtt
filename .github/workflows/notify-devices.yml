@@ -1,0 +1,39 @@
+# Dispara rebuild dos repos de device (PRD_OTA.md, F3b) quando muda algo deste
+# repo que entra no firmware congelado deles. Cada repo de device escuta
+# `repository_dispatch: deps-updated` e publica um Release novo (o grow_server
+# recebe pelo webhook, como qualquer Release).
+#
+# Repos de device: variavel DEVICE_REPOS (org ou repo, separados por espaco;
+# default growmatic/device_light). Token: secret GROWMATIC_DISPATCH_TOKEN
+# (fine-grained PAT, Contents: Read and write SO nos repos de device). Sem o
+# secret, o job so avisa e nao dispara nada.
+name: notify device repos
+
+on:
+  push:
+    branches: [master]
+    paths:
+      # so o que o manifest dos devices congela
+      - "mqtt_as/__init__.py"
+      - "mqtt_as/mqtt_v5_properties.py"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disparar rebuild dos repos de device
+        env:
+          GH_TOKEN: ${{ secrets.GROWMATIC_DISPATCH_TOKEN }}
+          DEVICE_REPOS: ${{ vars.DEVICE_REPOS || 'growmatic/device_light' }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::GROWMATIC_DISPATCH_TOKEN ausente: nenhum rebuild disparado"
+            exit 0
+          fi
+          for r in $DEVICE_REPOS; do
+            gh api "repos/$r/dispatches" -f event_type=deps-updated \
+              -f "client_payload[repo]=$GITHUB_REPOSITORY" \
+              -f "client_payload[sha]=$GITHUB_SHA"
+            echo "rebuild disparado em $r ($GITHUB_REPOSITORY@${GITHUB_SHA::7})"
+          done
