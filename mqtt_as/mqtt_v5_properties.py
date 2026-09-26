@@ -26,9 +26,17 @@ def encode_string(value):
 
 
 def encode_string_pair(value):
-    # just get the first key and value
-    key, value = list(value.items())[0]
-    return encode_string(key) + encode_string(value)
+    # User Property (0x26) pode repetir no mesmo pacote (MQTTv5 3.1.2.11.8).
+    # PATCH growmatic: codifica TODOS os pares do dict, nao so o primeiro --
+    # o identificador 0x26 do 1o par e escrito por encode_properties(); os
+    # seguintes levam o proprio 0x26 aqui (o comprimento total ja conta com
+    # esses bytes, porque encode_properties soma len() do valor codificado).
+    out = b""
+    for i, (key, val) in enumerate(value.items()):
+        if i:
+            out += b"\x26"
+        out += encode_string(key) + encode_string(val)
+    return out
 
 
 def encode_binary(value):
